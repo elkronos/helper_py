@@ -21,7 +21,7 @@ def analyze_sentiment(text, level='sentence'):
         inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
         outputs = model(**inputs)
         scores = softmax(outputs.logits.detach().numpy(), axis=1)
-        return (scores[:, 4] - scores[:, 0]).item()  # Difference between positive and negative scores
+        return (scores[:, 4] - scores[:, 0]).item()
     elif level == 'word':
         return afinn.score(text)
 
@@ -30,13 +30,12 @@ def process_text(text, sentiment_level='sentence'):
     processed_words = []
 
     for word in words:
-        word_clean = word.strip(string.punctuation).lower()  # Strip punctuation and convert to lower case
+        word_clean = word.strip(string.punctuation).lower()
         sentiment_score = analyze_sentiment(word_clean, level=sentiment_level)
 
         emotion_lexicon = {
             "happy": "joy", "sad": "sadness",
             "amazing": "surprise", "terrible": "anger",
-            # Add more words as needed
         }
         emotion = emotion_lexicon.get(word_clean, None)
 
