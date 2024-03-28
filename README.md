@@ -63,3 +63,26 @@ This script provides comprehensive functionality for sentiment and emotion analy
 - **Emotion Lexicon**: Includes a basic emotion lexicon mapping words to emotions like joy, sadness, surprise, and anger. This can be expanded as needed.
 - **Pandas DataFrame Integration**: Designed to work with pandas DataFrames, making it suitable for analyzing tabular data containing text.
 - **String Manipulation**: Employs Python's `string` module for basic text cleaning, like stripping punctuation and converting to lower case.
+
+
+## ProjectPath.py
+
+This module introduces the `ProjectPath` class, a robust solution for navigating and managing paths within Python projects. Here's a look at what it offers:
+
+**Core Class**:
+- `ProjectPath`: Facilitates dynamic identification and handling of paths relative to the project's root directory, based on customizable markers.
+
+**Features**:
+1. **Dynamic Project Root Discovery**: Utilizes directory markers (e.g., `.git`, `.svn`) to automatically find the project root.
+2. **Adaptable to Environment**: Capable of determining the start path correctly, whether executed in a script or interactive environments such as Jupyter notebooks.
+3. **Marker Customization**: Markers can be dynamically added, allowing for flexible adjustment to root discovery criteria.
+4. **Efficient Root Discovery**: Incorporates a caching mechanism to optimize the process of finding the project root across multiple operations.
+5. **Convenient Path Manipulation**: Provides a straightforward way to construct paths from the project root to various resources within the project.
+6. **Clear Error Reporting**: Offers informative error messages for cases where the project root cannot be determined with the given markers.
+
+**Example Usage**:
+```python
+# Initialize with specific markers and path parts
+project_file = ProjectPath("data", "mydata.csv", markers=['.git', 'my_project_marker.file'])
+print(project_file)  # Outputs the path as a string
+print(project_file.path())  # Returns the path as a Path object
