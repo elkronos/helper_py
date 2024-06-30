@@ -41,6 +41,22 @@ The script also contains several helper functions to provide the user with multi
 5. **Custom Character Replacement**: Allows for custom character replacement based on user-defined rules.
 
 
+## deduplicate_dataframe.py
+
+This script provides utilities to deduplicate pandas DataFrames. Here are its core features:
+
+**Main Function**: 
+- `deduplicate_dataframe()`: Accepts a DataFrame and a set of parameters to remove or flag duplicates based on user preferences.
+
+The script also contains several helper functions to provide the user with multiple features.
+
+1. **Column-Specific Deduplication**: Allows specifying one or more columns to check for duplicates.
+2. **Flagging Duplicates**: Option to flag duplicates instead of removing them by adding a boolean column.
+3. **Tie-Breaking Criteria**: Supports keeping the first or last occurrence of duplicates, or using a custom function.
+4. **Grouping**: Ability to group by specified columns before checking for duplicates.
+5. **Parameter Validation**: Ensures all provided parameters are valid and handles various edge cases.
+
+
 ## detect_sentiments_and_emotions.py
 
 This script provides comprehensive functionality for sentiment and emotion analysis in text data. It offers both word-level and sentence-level sentiment analysis using different methods.
