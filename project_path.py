@@ -20,7 +20,6 @@ class ProjectPath:
     def find_project_root(cls, start_path: Path, markers: Tuple[str, ...]) -> Path:
         """
         Cache-enabled method to find the project root by looking for directory markers.
-
         :param start_path: Path to start search from.
         :param markers: Markers to look for in directories.
         :return: Path object representing the project root directory.
@@ -47,7 +46,6 @@ class ProjectPath:
             markers = ['.git', '.hg', '.svn', 'pyproject.toml', 'setup.py', '.project']
         self.markers = markers
         self.path_parts = path_parts
-
         start_path = self.get_start_path()
         self.project_root = self.find_project_root(start_path, tuple(self.markers))
 
