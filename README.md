@@ -25,6 +25,35 @@ This script provides a utility for applying demographic weights to numerical col
    - Manage missing values to maintain accurate weight application.
 
 
+## audio_directory_scanner.py
+
+This Python script provides a utility for scanning directories, collecting metadata about files, and saving the gathered information into a CSV file. It is implemented using the Tkinter library for the GUI, allowing users to select a directory and view a progress bar during the scanning process. The script is particularly useful for cataloging files, including media files, by recording their duration.
+
+**Main Class**:
+- `DirectoryScannerApp`: The primary class that encapsulates the directory scanning functionality, file metadata collection, and user interaction through a Tkinter-based GUI.
+
+### Key Features:
+
+1. **Directory Scanning**:
+   - Recursively scans the selected directory and its subdirectories.
+   - Captures the file structure, including folder hierarchy and file types.
+   - Extracts the duration of media files (e.g., MP3, WAV, FLAC) using the Mutagen library.
+
+2. **CSV Export**:
+   - Saves the scanned file data to a CSV file, with columns dynamically adjusted based on directory depth.
+   - Automatically generates a timestamped CSV filename based on the directory name.
+   - Includes the file duration in the output for supported media files.
+
+3. **User Interface**:
+   - Utilizes Tkinter for a simple and interactive GUI.
+   - Provides dialog boxes for directory selection, error handling, and success notifications.
+   - Includes a progress bar that updates during the scanning process, keeping the user informed.
+
+4. **Error Handling**:
+   - Robust error handling with user-friendly messages for various issues like directory access errors or file processing failures.
+   - Ensures graceful application exit even in the event of errors.
+
+
 ## clean_names.py
 
 This script offers utilities to clean and transform string names. Here are its core features:
