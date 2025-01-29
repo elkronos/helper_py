@@ -110,6 +110,67 @@ This script provides comprehensive functionality for sentiment and emotion analy
 - **String Manipulation**: Employs Python's `string` module for basic text cleaning, like stripping punctuation and converting to lower case.
 
 
+## extract_archives.py
+
+This script automates the extraction of ZIP and RAR archives within a specified directory. It supports recursive extraction of nested archives, parallel processing for efficiency, and robust error handling. Additionally, the script provides options for verbosity, automatic deletion of archives after successful extraction, and simulation of the extraction process without making any changes.
+
+**Main Function**:
+- `process_directory()`: Traverses the given directory, identifies ZIP and RAR files, and extracts them in parallel batches. It handles nested archives iteratively, manages retries for failed extractions, and cleans up empty directories post-extraction.
+
+### Key Features:
+
+1. **Comprehensive Archive Support**:
+   - Extracts both ZIP and RAR file formats.
+   - Validates archive integrity before extraction to ensure data consistency.
+
+2. **Parallel Processing**:
+   - Utilizes `ThreadPoolExecutor` for concurrent extraction, significantly speeding up the processing of multiple archives.
+   - Configurable number of worker threads to optimize performance based on system capabilities.
+
+3. **Nested Archive Handling**:
+   - Automatically detects and extracts archives contained within other archives, ensuring thorough processing of all nested files.
+
+4. **Robust Logging**:
+   - Logs detailed information about the extraction process, including successes, failures, and actions taken.
+   - Outputs logs to both the console and a dedicated log file (`extract_archives.log`) for easy monitoring and troubleshooting.
+
+5. **Flexible Deletion Options**:
+   - Option to automatically delete archives after successful extraction.
+   - Interactive prompts for manual approval of archive deletion, with an option to approve all subsequent deletions.
+
+6. **Error Handling and Recovery**:
+   - Moves problematic archives to a `failed_archives` directory for later review.
+   - Implements retry mechanisms for transient extraction failures, enhancing reliability.
+
+7. **Dry-Run Capability**:
+   - Simulate the extraction process without making any actual changes, allowing users to verify actions before execution.
+
+8. **Customizable Exclusions**:
+   - Excludes specified files and directories from processing based on predefined patterns or user-defined criteria.
+   - Easily extendable to incorporate more complex exclusion logic as needed.
+
+9. **User-Friendly Command-Line Interface**:
+   - Intuitive argument parsing for specifying directories, verbosity, deletion preferences, and more.
+   - Provides clear feedback and progress indicators during execution, including a dynamic progress bar.
+
+### Usage:
+
+```bash
+python extract_archives.py /path/to/directory [options]
+```
+
+**Arguments**:
+- `directory` (str): Directory to process.
+
+**Options**:
+- `--verbose`: Increase output verbosity.
+- `--auto-delete`: Automatically approve all deletions.
+- `--unrar-path`: Specify the path to `UnRAR.exe` if different from the default.
+- `--dry-run`: Simulate the extraction process without making changes.
+- `--max-workers` (int): Maximum number of worker threads for parallel extraction (default: 4).
+- `--batch-size` (int): Number of archives to process per batch (default: 100).
+
+
 ## ProjectPath.py
 
 This module introduces the `ProjectPath` class, a robust solution for navigating and managing paths within Python projects. Here's a look at what it offers:
