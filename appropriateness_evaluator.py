@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Enhanced AppropriatenessEvaluator
+appropriateness_evaluator
 
 This module evaluates whether given items (e.g., ingredients) are “appropriate” in a particular context.
 It uses a combination of TF–IDF, SentenceTransformer embeddings, a Ridge regression classifier,
