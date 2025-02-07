@@ -1,7 +1,6 @@
 # helper_py
 This repo contains functions designed to provide assistance in working with data.
 
-
 ## apply_weights.py
 
 This script provides a utility for applying demographic weights to numerical columns in a Pandas DataFrame. The main function, `apply_weights()`, accommodates multiple demographic variables and corresponding weights, creating new weighted columns in the DataFrame. This utility is particularly useful in survey data analysis, ensuring that the analyzed data is representative of the actual population.
@@ -24,6 +23,47 @@ This script provides a utility for applying demographic weights to numerical col
    - Conduct input checks for type and value validation, ensuring consistency in the weighting process.
    - Manage missing values to maintain accurate weight application.
 
+## appropriateness_evaluator.py
+
+This script provides a comprehensive utility for evaluating whether given items (e.g., ingredients) are “appropriate” within a specified context. The core of the utility is the `AppropriatenessEvaluator` class, which combines traditional NLP techniques with modern machine learning and LLM-based methods to assess item suitability.
+
+**Main Class**:
+- `AppropriatenessEvaluator`:
+  - Initializes with a context description, an optional dataset (or uses a sample dataset), and various configurable thresholds.
+  - Preprocesses text by normalizing, tokenizing, removing stopwords, and lemmatizing each item.
+  - Labels dataset entries as appropriate/inappropriate based on item frequency.
+  - Constructs a unified feature matrix by combining TF–IDF vectors and SentenceTransformer embeddings.
+  - Trains a Ridge regression classifier to predict item appropriateness.
+  - Enhances evaluation using nearest neighbors for similarity checking, Local Outlier Factor (LOF) for density-based outlier detection, and LLM-based conditional probability checks via the OpenAI API.
+  - Provides methods to evaluate both individual and multiple items interactively.
+
+### Key Features:
+
+1. **Advanced Text Preprocessing**:
+   - Converts text to lowercase and removes special characters.
+   - Tokenizes, removes stopwords, and lemmatizes tokens to standardize input data.
+
+2. **Feature Engineering & Model Training**:
+   - Utilizes TF–IDF vectorization alongside SentenceTransformer embeddings.
+   - Combines sparse and dense representations into a single feature matrix.
+   - Trains a Ridge regression classifier to score item appropriateness.
+
+3. **Similarity and Density-Based Adjustments**:
+   - Applies nearest neighbors analysis to measure cosine similarity with known appropriate items.
+   - Uses Local Outlier Factor (LOF) to detect density-based anomalies among items.
+
+4. **LLM-Enhanced Evaluation**:
+   - Retrieves conditional probability scores from an LLM (via OpenAI API) to further refine decisions.
+   - Overrides classifier decisions if the LLM probability falls below a specified threshold.
+
+5. **Interactive and Flexible Data Input**:
+   - Supports custom datasets via CSV or a built-in sample dataset.
+   - Provides an interactive CLI to input context and items for evaluation, along with secure API key handling.
+
+6. **Robust Logging and Error Handling**:
+   - Implements detailed logging for tracking processing steps and debugging.
+   - Includes error management for API calls, model predictions, and data processing issues.
+  
 
 ## audio_directory_scanner.py
 
