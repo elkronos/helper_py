@@ -1,30 +1,14 @@
-import functools
-import inspect
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
-if not logging.getLogger().handlers:
-    logging.basicConfig(level=logging.INFO)
-
-
-def profile(func: Callable) -> Callable:
-    """Decorator to log the execution time of a function."""
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        start = time.perf_counter()
-        result = func(*args, **kwargs)
-        elapsed = time.perf_counter() - start
-        logger.info("Function %s executed in %.4f seconds", func.__name__, elapsed)
-        return result
-
-    return wrapper
 
 
 # ----------------------------
@@ -62,6 +46,10 @@ def _resolve_cols(
       - "A,B" / "A B" / "A|B" -> split
       - "-col1,col2" / "!col1 col2" -> all columns except those (if allow_exclude)
       - list/tuple/set of strings
+
+    Note: column names containing whitespace, commas, or pipes cannot be
+    expressed via the string spec (they would be split). Pass such columns
+    via the list form, e.g., on=["first name", "a,b"].
     """
     if spec is None:
         return None
@@ -84,6 +72,11 @@ def _resolve_cols(
         tokens = _split_columns(raw)
         invalid = [c for c in tokens if c not in df_cols]
         if invalid:
+            if raw in df_cols:
+                raise ValueError(
+                    f"Column name '{raw}' contains whitespace; pass a list "
+                    f"(e.g., {name}=['{raw}']) instead of a string."
+                )
             raise ValueError(f"Invalid column name(s) in {name}: {invalid}")
         return tokens
 
@@ -111,7 +104,11 @@ def _unique_preserve_order(items: List[str]) -> List[str]:
 # Pick (tie-break) specification
 # ----------------------------
 
-Pick = Union[str, Callable[..., pd.DataFrame]]
+Pick = Union[
+    str,
+    Callable[..., pd.DataFrame],
+    List[Union[str, Callable[..., pd.DataFrame]]],
+]
 
 
 @dataclass(frozen=True)
@@ -125,7 +122,8 @@ def _parse_pick(pick: Pick) -> Tuple[PickSpec, Optional[Callable[..., pd.DataFra
     pick can be:
       - "first" / "last" / "random"
       - "max:col" / "min:col"
-      - callable: custom(group) or custom(group, key)
+      - callable: custom(group, key) -- always called with both arguments;
+        accept and ignore `key` if you don't need it.
     """
     if callable(pick):
         return PickSpec(kind="custom"), pick
@@ -159,18 +157,36 @@ def _parse_pick(pick: Pick) -> Tuple[PickSpec, Optional[Callable[..., pd.DataFra
 
 
 def _call_custom(custom_fn: Callable[..., pd.DataFrame], group: pd.DataFrame) -> pd.DataFrame:
-    sig = inspect.signature(custom_fn)
-    if len(sig.parameters) >= 2:
-        return custom_fn(group, getattr(group, "name", None))
-    return custom_fn(group)
+    # Single contract: custom callables always receive (group, key) positionally.
+    # Callables that don't need the key should accept it and ignore it. This
+    # avoids signature inspection, which is fooled by *args, functools.wraps,
+    # and partials.
+    return custom_fn(group, getattr(group, "name", None))
+
+
+def _parse_pandas_version(v: str) -> Tuple[int, int]:
+    """Parse 'MAJOR.MINOR(.PATCH)?(suffix)?' into (major, minor); non-numeric suffixes are ignored."""
+    parts = v.split(".")
+
+    def _to_int(s: str) -> int:
+        m = re.match(r"\d+", s)
+        return int(m.group()) if m else 0
+
+    major = _to_int(parts[0]) if len(parts) > 0 else 0
+    minor = _to_int(parts[1]) if len(parts) > 1 else 0
+    return major, minor
+
+
+# `include_groups=False` was added in pandas 2.2.0. Detect once at import time
+# so we don't conflate a user callable's TypeError with pandas' own signature.
+_SUPPORTS_INCLUDE_GROUPS = _parse_pandas_version(pd.__version__) >= (2, 2)
 
 
 def _groupby_apply(grouped, func):
     """GroupBy.apply wrapper that uses modern behavior when available."""
-    try:
+    if _SUPPORTS_INCLUDE_GROUPS:
         return grouped.apply(func, include_groups=False)
-    except TypeError:
-        return grouped.apply(func)
+    return grouped.apply(func)
 
 
 # ----------------------------
@@ -249,19 +265,104 @@ class _UnionFind:
             self.rank[ra] += 1
 
 
+# Sentinel/placeholder values to drop during entity tokenization.
+#
+# In identity data, values like "0", "-1", "n/a", "unknown", or "" are
+# placeholders for "no value" rather than real identifiers. With
+# scope="global" they would otherwise act as connecting tokens and silently
+# collapse unrelated entities into one giant component. Tokens whose
+# canonical form (see `_canonical_token`) appears in this set are dropped.
+#
+# To replace or extend the default, pass an explicit `ignore=` to
+# `_explode_id_value`, e.g.:
+#     _explode_id_value(v, split=True, sep_regex=r"[;,|]+",
+#                       ignore=DEFAULT_IGNORE | {"placeholder", "tbd"})
+DEFAULT_IGNORE: frozenset = frozenset({
+    "", "0", "00000000", "n/a", "na", "none", "null", "unknown", "-", "-1",
+})
+
+
+def _type_tag(t: Any) -> str:
+    """Return the canonical type prefix used by :func:`_canonical_token`
+    (without the trailing ``:``). Kept in lockstep with ``_canonical_token``
+    so callers can compute the bare form once and prepend the tag, instead of
+    invoking ``_canonical_token`` twice per token in hot loops. ``bool`` must
+    be checked before ``int`` because ``bool`` is a subclass of ``int``.
+    """
+    if isinstance(t, bool):
+        return "bool"
+    if isinstance(t, (int, np.integer)):
+        return "int"
+    if isinstance(t, (float, np.floating)):
+        return "num"
+    return "str"
+
+
+def _canonical_token(t: Any, *, coerce_token_types: bool = False) -> Optional[str]:
+    """
+    Coerce a token to a canonical string form for hashing/comparison.
+
+    By default, each token is prefixed with its type (``str:``, ``int:``,
+    ``num:``, ``bool:``) so values of different types do not silently collide
+    within the same column -- e.g., the int ``123`` and the string ``"123"``
+    end up as ``"int:123"`` vs ``"str:123"``. This is the safer default after
+    CSV/JSON round-trips where ``True``/``1`` or ``False``/``0`` could
+    otherwise be conflated. Note that ``bool`` must be checked before ``int``
+    because Python's ``bool`` is a subclass of ``int``.
+
+    For floats, ``format(x, '.17g')`` is used (round-trip safe, unlike
+    ``repr``); ``NaN`` returns ``None`` so callers can drop it. Strings are
+    ``.strip().casefold()``-ed for case-insensitive comparison across locales.
+
+    Pass ``coerce_token_types=True`` to drop the type prefix when the caller
+    explicitly wants cross-type matches (e.g., to treat the int ``123`` and
+    the string ``"123"`` as the same identifier after a lossy round-trip).
+    """
+    if isinstance(t, bool):
+        s = "true" if t else "false"
+        return s if coerce_token_types else f"bool:{s}"
+    if isinstance(t, (int, np.integer)):
+        s = str(int(t))
+        return s if coerce_token_types else f"int:{s}"
+    if isinstance(t, (float, np.floating)):
+        f = float(t)
+        if math.isnan(f):
+            return None
+        s = format(f, '.17g')
+        return s if coerce_token_types else f"num:{s}"
+    s = str(t).strip().casefold()
+    return s if coerce_token_types else f"str:{s}"
+
+
 def _explode_id_value(
     v: Any,
     *,
     split: bool,
-    sep_regex: str,
+    sep_compiled: Optional[re.Pattern],
+    ignore: frozenset = DEFAULT_IGNORE,
     strip: bool = True,
-) -> List[Any]:
+    coerce_token_types: bool = False,
+) -> List[str]:
     """
-    Turns a cell value into zero or more identifier tokens.
+    Turns a cell value into zero or more canonical identifier tokens.
       - None/NaN -> []
       - list/tuple/set -> flattened recursively
       - string -> optionally split on separators (e.g., "a;b|c")
       - other scalar -> [value]
+
+    Each surviving token is passed through :func:`_canonical_token`, which by
+    default prefixes the token with its type (``str:``, ``int:``, ``num:``,
+    ``bool:``) so the int ``123`` and the string ``"123"`` do not silently
+    collide after a CSV/JSON round-trip, and ``True``/``1`` /
+    ``False``/``0`` cannot accidentally link. Pass ``coerce_token_types=True``
+    when cross-type matches are desired (the prefix is dropped and types
+    merge).
+
+    Tokens whose un-prefixed canonical form is in `ignore` are dropped so
+    that sentinel/placeholder values such as "0", "-1", "n/a", "unknown",
+    or "" cannot act as connecting tokens and silently link unrelated
+    entities under scope="global". Defaults to `DEFAULT_IGNORE`; pass an
+    explicit set to replace or extend it.
     """
     if v is None:
         return []
@@ -272,21 +373,39 @@ def _explode_id_value(
         pass
 
     if isinstance(v, (list, tuple, set, frozenset)):
-        out: List[Any] = []
+        nested: List[str] = []
         for x in v:
-            out.extend(_explode_id_value(x, split=split, sep_regex=sep_regex, strip=strip))
-        return out
+            nested.extend(_explode_id_value(
+                x, split=split, sep_compiled=sep_compiled, ignore=ignore, strip=strip,
+                coerce_token_types=coerce_token_types,
+            ))
+        return nested
 
     if isinstance(v, str):
         s = v.strip() if strip else v
         if not s:
             return []
-        if split and re.search(sep_regex, s):
-            parts = [p.strip() for p in re.split(sep_regex, s) if p and p.strip()]
-            return parts
-        return [s]
+        if split and sep_compiled is not None and sep_compiled.search(s):
+            tokens = [p.strip() for p in sep_compiled.split(s) if p and p.strip()]
+        else:
+            tokens = [s]
+    else:
+        tokens = [v]
 
-    return [v]
+    # Canonicalize at the bottom so callers always receive hashable,
+    # type-stable strings. Compute the *un-prefixed* canonical form once and
+    # check it against `ignore` before re-attaching the type tag, so we don't
+    # call `_canonical_token` twice per token in this hot loop. Ignore-set
+    # membership is checked against the bare form so DEFAULT_IGNORE entries
+    # like "0" or "n/a" still match regardless of whether the original value
+    # arrived as an int, float, or string after a CSV/JSON round-trip.
+    out: List[str] = []
+    for t in tokens:
+        bare = _canonical_token(t, coerce_token_types=True)
+        if bare is None or bare in ignore:
+            continue
+        out.append(bare if coerce_token_types else f"{_type_tag(t)}:{bare}")
+    return out
 
 
 def _group_ids_from_entity_by(
@@ -296,6 +415,8 @@ def _group_ids_from_entity_by(
     scope: Literal["global", "per_column"] = "global",
     split_values: bool = True,
     sep_regex: str = r"[;,|]+",
+    ignore: frozenset = DEFAULT_IGNORE,
+    coerce_token_types: bool = False,
 ) -> pd.Series:
     """
     Build entity groups by connectivity across identifier tokens.
@@ -307,11 +428,15 @@ def _group_ids_from_entity_by(
     n = len(df)
     uf = _UnionFind(n)
     first_seen: Dict[Any, int] = {}
-    idx = df.index.to_list()
+    sep_compiled = re.compile(sep_regex) if split_values else None
 
-    for i, row_index in enumerate(idx):
-        for col in entity_cols:
-            tokens = _explode_id_value(df.at[row_index, col], split=split_values, sep_regex=sep_regex)
+    for col in entity_cols:
+        values = df[col].to_numpy(dtype=object, copy=False)
+        for i in range(n):
+            tokens = _explode_id_value(
+                values[i], split=split_values, sep_compiled=sep_compiled, ignore=ignore,
+                coerce_token_types=coerce_token_types,
+            )
             for t in tokens:
                 key = (col, t) if scope == "per_column" else t
                 j = first_seen.get(key)
@@ -320,7 +445,7 @@ def _group_ids_from_entity_by(
                 else:
                     uf.union(i, j)
 
-    roots = np.asarray([uf.find(i) for i in range(n)], dtype=np.int64)
+    roots = np.fromiter((uf.find(i) for i in range(n)), dtype=np.int64, count=n)
     codes, _ = pd.factorize(roots, sort=False)
     return pd.Series(codes, index=df.index, name="_group_id")
 
@@ -388,17 +513,105 @@ def _reorder_like_input(df_in: pd.DataFrame, df_out: pd.DataFrame) -> pd.DataFra
     return df_out.loc[df_out.index[order]]
 
 
+def _apply_pick(
+    df: pd.DataFrame,
+    pick: Union[str, Callable[..., pd.DataFrame]],
+    key_cols: List[str],
+    *,
+    allow_ties: bool = False,
+    random_state: Optional[int] = None,
+) -> pd.DataFrame:
+    """
+    Reduce df to a per-group survivor set defined by key_cols, according to `pick`.
+
+    When allow_ties=True (used by intermediate selectors in a chained pick),
+    rows tied at the chosen max/min are all kept so the next selector can
+    break the tie. "first"/"last"/"random" inherently pick a single row, so
+    allow_ties has no effect on them -- they're terminal selectors.
+    """
+    pick_spec, pick_fn = _parse_pick(pick)
+
+    if pick_spec.kind == "first":
+        return df.drop_duplicates(subset=key_cols, keep="first")
+
+    if pick_spec.kind == "last":
+        return df.drop_duplicates(subset=key_cols, keep="last")
+
+    if pick_spec.kind == "random":
+        gb = df.groupby(key_cols, sort=False, group_keys=False)
+        try:
+            out = gb.sample(n=1, random_state=random_state)
+        except Exception:
+            out = _groupby_apply(
+                gb, lambda g: df.loc[g.index].sample(n=1, random_state=random_state)
+            )
+        return _reorder_like_input(df, out)
+
+    if pick_spec.kind in {"max", "min"}:
+        assert pick_spec.column is not None
+        if allow_ties:
+            gb = df.groupby(key_cols, sort=False)[pick_spec.column]
+            extreme = gb.transform("max" if pick_spec.kind == "max" else "min")
+            v = df[pick_spec.column]
+            mask = v.eq(extreme) | (v.isna() & extreme.isna())
+            return df.loc[mask]
+        return _select_extreme_row(df, key_cols, pick_spec.column, pick_spec.kind)  # type: ignore[arg-type]
+
+    # custom callable
+    assert pick_fn is not None
+    gb = df.groupby(key_cols, sort=False, group_keys=False)
+    out = _groupby_apply(gb, lambda g: _call_custom(pick_fn, df.loc[g.index]))
+    return _reorder_like_input(df, out)
+
+
+def _apply_pick_chain(
+    df: pd.DataFrame,
+    pick: Pick,
+    key_cols: List[str],
+    *,
+    random_state: Optional[int] = None,
+) -> pd.DataFrame:
+    """Dispatch single-pick or list-of-picks to _apply_pick, applying chained
+    picks left-to-right on the shrinking survivor set."""
+    if isinstance(pick, list):
+        if not pick:
+            raise ValueError("pick=[] is not allowed; provide at least one selector.")
+        # Apply each pick in sequence on the survivor set; the last one must
+        # produce a unique survivor per group (or use "first" implicitly).
+        # Reject terminal selectors ("first"/"last"/"random") in non-final
+        # positions: they each pick exactly one row, so any later selector
+        # would be a silent no-op -- almost certainly a user error.
+        keep_df = df
+        for sub_pick in pick[:-1]:
+            sub_spec, _ = _parse_pick(sub_pick)
+            if sub_spec.kind in {"first", "last", "random"}:
+                raise ValueError(
+                    f"pick='{sub_spec.kind}' is a terminal selector and must be "
+                    f"the last element of a chained pick (it picks one row per "
+                    f"group, so later selectors would be no-ops); "
+                    f"move it to the end or remove it."
+                )
+            keep_df = _apply_pick(keep_df, sub_pick, key_cols, allow_ties=True, random_state=random_state)
+        keep_df = _apply_pick(keep_df, pick[-1], key_cols, allow_ties=False, random_state=random_state)
+        return keep_df
+    return _apply_pick(df, pick, key_cols, allow_ties=False, random_state=random_state)
+
+
 # ----------------------------
 # Main API
 # ----------------------------
 
-@profile
+# Sentinel used to detect whether the caller explicitly passed `pick`.
+# Needed so the `keep=` alias can't silently override an explicit `pick=`.
+_UNSET: Any = object()
+
+
 def deduplicate_dataframe(
     df: pd.DataFrame,
     on: ColSpec = None,
     *,
     action: str = "remove",
-    pick: Pick = "first",
+    pick: Pick = _UNSET,
     group_by: ColSpec = None,
     entity_by: Union[ColSpec, Literal["auto"], bool] = None,
     block_by: ColSpec = None,
@@ -412,6 +625,8 @@ def deduplicate_dataframe(
     entity_scope: Literal["global", "per_column"] = "global",
     split_entity_values: bool = True,
     entity_separators_regex: str = r"[;,|]+",
+    entity_ignore_values: Optional[Iterable] = None,
+    coerce_token_types: bool = False,
     **kwargs: Any,
 ) -> Union[pd.DataFrame, Tuple[pd.DataFrame, Dict[str, Any]]]:
     """
@@ -437,7 +652,38 @@ def deduplicate_dataframe(
     pick:
       - "first" / "last" / "random"
       - "max:col" / "min:col"
-      - callable(group)->DataFrame or callable(group, key)->DataFrame
+      - callable(group, key)->DataFrame -- always called with both arguments
+        positionally; callables that don't need the key should accept it and
+        ignore it (e.g., `def pick_fn(group, _key): ...`).
+        NOTE: This is a breaking change from earlier versions, which also
+        accepted a one-arg callable(group)->DataFrame. Single-arg callables
+        will now raise TypeError; wrap them as `lambda g, _k: fn(g)` to adapt.
+      - list of any of the above for chained tie-breakers, applied
+        left-to-right on the shrinking survivor set
+        (e.g., ["max:score", "max:timestamp"] = max score, then latest
+        timestamp; the last selector must reduce each group to one row,
+        so use "first" implicitly if needed).
+
+    group_id_column:
+      Optional name for an output column carrying the group/entity id assigned
+      during grouping. Note that this column's coverage differs by action: in
+      action="remove" mode only the surviving (kept) rows carry the gid because
+      removed rows are no longer present, while in action="flag" mode every row
+      (kept and flagged alike) carries its gid so callers can inspect group
+      membership for duplicates as well.
+
+    entity_ignore_values:
+      Optional iterable of canonical (un-prefixed, casefolded) token strings to
+      treat as placeholders during entity linking. When None (default), uses
+      DEFAULT_IGNORE ({"", "0", "n/a", "none", "unknown", "-1", ...}). Pass an
+      explicit set to replace it, e.g. `DEFAULT_IGNORE | {"placeholder", "tbd"}`
+      to extend, or `frozenset()` to disable placeholder filtering entirely.
+
+    coerce_token_types:
+      If False (default), entity tokens are prefixed with their type tag
+      (``str:``, ``int:``, ``num:``, ``bool:``) so the int ``123`` and the
+      string ``"123"`` cannot silently link after a CSV/JSON round-trip. Set
+      True to drop the prefix when cross-type matches are intentional.
     """
     # Optional aliases for short, common patterns.
     if "subset" in kwargs and on is None:
@@ -458,8 +704,12 @@ def deduplicate_dataframe(
     if "block" in kwargs and block_by is None:
         block_by = kwargs.pop("block")
 
-    if "keep" in kwargs and pick == "first":
+    if "keep" in kwargs:
+        if pick is not _UNSET:
+            raise TypeError("Pass either pick= or keep=, not both.")
         pick = kwargs.pop("keep")
+    if pick is _UNSET:
+        pick = "first"
 
     if kwargs:
         unknown = ", ".join(sorted(kwargs.keys()))
@@ -467,6 +717,14 @@ def deduplicate_dataframe(
 
     if not isinstance(df, pd.DataFrame):
         raise ValueError("df must be a pandas DataFrame.")
+
+    start = time.perf_counter()
+
+    # Normalize the index for all internal work: a unique RangeIndex makes
+    # get_indexer / isin / loc / groupby safe even when the caller's index has
+    # duplicate labels. The original index is restored on the way out.
+    _original_index = df.index
+    df = df.reset_index(drop=True)
 
     # Normalize action
     a = str(action).strip().lower()
@@ -476,6 +734,14 @@ def deduplicate_dataframe(
         action_n = "flag"
     else:
         raise ValueError("action must be 'remove'/'flag' (or a common synonym).")
+
+    # Validate output column names won't collide with existing columns.
+    if action_n == "flag" and flag_column in df.columns:
+        raise ValueError(f"flag_column '{flag_column}' already exists in df.")
+    if group_id_column is not None and group_id_column in df.columns:
+        raise ValueError(f"group_id_column '{group_id_column}' already exists in df.")
+    if action_n == "flag" and group_id_column == flag_column:
+        raise ValueError("flag_column and group_id_column must differ.")
 
     # Parse on spec (exact vs connectivity)
     on_spec = _parse_on_spec(on, df.columns)
@@ -517,11 +783,27 @@ def deduplicate_dataframe(
     else:
         group_cols_for_grouping = group_cols_input
 
-    pick_spec, pick_fn = _parse_pick(pick)
-    if pick_spec.kind in {"max", "min"}:
-        assert pick_spec.column is not None
-        if pick_spec.column not in df.columns:
-            raise ValueError(f"pick column '{pick_spec.column}' not found in DataFrame.")
+    # Validate pick (single or list); each max:/min: element must reference a
+    # column present in df with a numeric/datetime/boolean dtype.
+    if isinstance(pick, list):
+        if not pick:
+            raise ValueError("pick=[] is not allowed; provide at least one selector.")
+        _pick_items: List[Union[str, Callable[..., pd.DataFrame]]] = list(pick)
+    else:
+        _pick_items = [pick]
+    for _item in _pick_items:
+        _spec, _ = _parse_pick(_item)
+        if _spec.kind in {"max", "min"}:
+            assert _spec.column is not None
+            if _spec.column not in df.columns:
+                raise ValueError(f"pick column '{_spec.column}' not found in DataFrame.")
+            if not pd.api.types.is_numeric_dtype(df[_spec.column]) \
+               and not pd.api.types.is_datetime64_any_dtype(df[_spec.column]) \
+               and not pd.api.types.is_bool_dtype(df[_spec.column]):
+                raise TypeError(
+                    f"pick='{_spec.kind}:{_spec.column}' requires a numeric, "
+                    f"datetime, or boolean column; got {df[_spec.column].dtype}."
+                )
 
     is_grouped = (group_cols_for_grouping is not None) or (entity_cols is not None)
     if mode_n == "auto":
@@ -540,6 +822,12 @@ def deduplicate_dataframe(
 
     elif entity_cols is not None:
         grouping_kind = "entity_by"
+        # Resolve the user-supplied ignore set to a frozenset once; default to
+        # DEFAULT_IGNORE when the caller didn't provide one.
+        entity_ignore = (
+            DEFAULT_IGNORE if entity_ignore_values is None
+            else frozenset(entity_ignore_values)
+        )
         if block_cols:
             parts: List[pd.Series] = []
             offset = 0
@@ -550,6 +838,8 @@ def deduplicate_dataframe(
                     scope=entity_scope,
                     split_values=split_entity_values,
                     sep_regex=entity_separators_regex,
+                    ignore=entity_ignore,
+                    coerce_token_types=coerce_token_types,
                 )
                 local_gid = local_gid + offset
                 offset = int(local_gid.max()) + 1 if len(local_gid) else offset
@@ -562,6 +852,8 @@ def deduplicate_dataframe(
                 scope=entity_scope,
                 split_values=split_entity_values,
                 sep_regex=entity_separators_regex,
+                ignore=entity_ignore,
+                coerce_token_types=coerce_token_types,
             )
 
     # Effective exact columns for "within" mode.
@@ -571,78 +863,28 @@ def deduplicate_dataframe(
     # ---- Compute rows to keep ----
     if group_id is None:
         # Global (no grouping): exact-key dedupe on on_cols_exact
-        if pick_spec.kind in {"first", "last"}:
-            keep = "first" if pick_spec.kind == "first" else "last"
-            keep_df = work.drop_duplicates(subset=on_cols_exact, keep=keep)
-
-        elif pick_spec.kind == "random":
-            shuffled = work.sample(frac=1.0, random_state=random_state)
-            keep_df = shuffled.drop_duplicates(subset=on_cols_exact, keep="first")
-            keep_df = _reorder_like_input(work, keep_df)
-
-        elif pick_spec.kind in {"max", "min"}:
-            keep_df = _select_extreme_row(work, on_cols_exact, pick_spec.column, pick_spec.kind)  # type: ignore[arg-type]
-
-        else:
-            assert pick_fn is not None
-            grouped = work.groupby(on_cols_exact, sort=False, group_keys=False)
-            keep_df = _groupby_apply(grouped, lambda g: _call_custom(pick_fn, work.loc[g.index]))
-            keep_df = _reorder_like_input(work, keep_df)
+        keep_df = _apply_pick_chain(work, pick, on_cols_exact, random_state=random_state)
 
     else:
-        # Grouped behavior
-        gid_name = group_id.name or "_group_id"
+        # Grouped behavior. The gid is an internal implementation detail; pick a
+        # name that's guaranteed not to clobber a user column (e.g., a df that
+        # already has a column literally named "_group_id"). Note that
+        # `group_id.name` is always "_group_id" today -- both _group_ids_from_*
+        # builders hardcode it -- so we don't bother consulting it here.
+        gid_name = "_group_id"
+        while gid_name in work.columns:
+            gid_name = "_" + gid_name
         work2 = work.copy()
         work2[gid_name] = group_id
 
         if mode_n == "collapse":
             # One row per group/entity (consolidation)
-            if pick_spec.kind == "first":
-                keep_df = work2.groupby(gid_name, sort=False, group_keys=False).head(1)
-            elif pick_spec.kind == "last":
-                keep_df = work2.groupby(gid_name, sort=False, group_keys=False).tail(1)
-            elif pick_spec.kind == "random":
-                gb = work2.groupby(gid_name, sort=False, group_keys=False)
-                try:
-                    keep_df = gb.sample(n=1, random_state=random_state)
-                except Exception:
-                    keep_df = _groupby_apply(gb, lambda g: work2.loc[g.index].sample(n=1, random_state=random_state))
-                keep_df = _reorder_like_input(work2, keep_df)
-            elif pick_spec.kind in {"max", "min"}:
-                keep_df = _select_extreme_row(work2, [gid_name], pick_spec.column, pick_spec.kind)  # type: ignore[arg-type]
-            else:
-                assert pick_fn is not None
-                gb = work2.groupby(gid_name, sort=False, group_keys=False)
-                keep_df = _groupby_apply(gb, lambda g: _call_custom(pick_fn, work2.loc[g.index]))
-                keep_df = _reorder_like_input(work2, keep_df)
+            keep_df = _apply_pick_chain(work2, pick, [gid_name], random_state=random_state)
 
         else:
             # within: exact-key dedupe within each group/entity using on_cols_exact
             key_cols = _unique_preserve_order([gid_name] + list(on_cols_exact))
-
-            if pick_spec.kind in {"first", "last"}:
-                keep = "first" if pick_spec.kind == "first" else "last"
-                keep_df = work2.drop_duplicates(subset=key_cols, keep=keep)
-
-            elif pick_spec.kind == "random":
-                gb = work2.groupby(gid_name, sort=False, group_keys=False)
-                try:
-                    shuffled = gb.sample(frac=1.0, random_state=random_state)
-                except Exception:
-                    shuffled = _groupby_apply(
-                        gb, lambda g: work2.loc[g.index].sample(frac=1.0, random_state=random_state)
-                    )
-                keep_df = shuffled.drop_duplicates(subset=key_cols, keep="first")
-                keep_df = _reorder_like_input(work2, keep_df)
-
-            elif pick_spec.kind in {"max", "min"}:
-                keep_df = _select_extreme_row(work2, key_cols, pick_spec.column, pick_spec.kind)  # type: ignore[arg-type]
-
-            else:
-                assert pick_fn is not None
-                gb = work2.groupby(key_cols, sort=False, group_keys=False)
-                keep_df = _groupby_apply(gb, lambda g: _call_custom(pick_fn, work2.loc[g.index]))
-                keep_df = _reorder_like_input(work2, keep_df)
+            keep_df = _apply_pick_chain(work2, pick, key_cols, random_state=random_state)
 
         if group_id_column is None:
             keep_df = keep_df.drop(columns=[gid_name])
@@ -658,6 +900,15 @@ def deduplicate_dataframe(
         if group_id is not None and group_id_column is not None:
             out[group_id_column] = group_id
 
+    # Restore the caller's original index. In "flag" mode `out` has one row per
+    # input row (same positional index), so the original index maps directly.
+    # In "remove" mode `out` is a subset; index it positionally into the
+    # original index to recover the labels for the surviving rows.
+    if action_n == "flag":
+        out.index = _original_index
+    else:
+        out.index = _original_index[out.index]
+
     # ---- Stats ----
     kept_count = int(len(keep_df))
     removed_count = int(original_count - kept_count)
@@ -667,15 +918,20 @@ def deduplicate_dataframe(
         "original_count": int(original_count),
         "kept_count": kept_count,
         "removed_count": removed_count if action_n == "remove" else 0,
-        "flagged_count": flagged_count if action_n == "flag" else 0,
+        "flagged_count": flagged_count,
         "grouping": grouping_kind,
         "mode": mode_n,
-        "pick": (pick if isinstance(pick, str) else getattr(pick, "__name__", "custom_callable")),
+        "pick": (
+            [p if isinstance(p, str) else getattr(p, "__name__", "custom_callable") for p in pick]
+            if isinstance(pick, list)
+            else (pick if isinstance(pick, str) else getattr(pick, "__name__", "custom_callable"))
+        ),
         "on_kind": on_spec.kind,
         "on_cols": on_spec.cols,
         "entity_by": entity_cols if grouping_kind == "entity_by" else None,
         "group_by": group_cols_for_grouping if grouping_kind == "group_by" else None,
         "block_by": block_cols if block_cols else None,
+        "elapsed_seconds": time.perf_counter() - start,
     }
     if log_stats:
         logger.info("Deduplication stats: %s", stats)
